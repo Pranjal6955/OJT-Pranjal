@@ -1,0 +1,309 @@
+import io
+import os
+import uuid
+import threading
+import tempfile
+import traceback
+import time
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dateutil.parser import parse as parse_date
+import fitz  # PyMuPDF
+
+from gemini_helper import split_work_into_days, generate_journal_entry
+from pdf_filler import fill_pdf_with_overlay
+
+app = FastAPI(title="OJT Journal Maker")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory task storage
+tasks: dict = {}
+task_files: dict = {}  # task_id -> temp file path
+task_timestamps: dict = {}  # task_id -> creation time (for cleanup)
+
+TASK_TTL_SECONDS = 3600  # Clean up tasks older than 1 hour
+
+
+def cleanup_old_tasks():
+    """Remove tasks and temp files older than TASK_TTL_SECONDS."""
+    now = time.time()
+    stale = [tid for tid, ts in list(task_timestamps.items()) if now - ts > TASK_TTL_SECONDS]
+    for tid in stale:
+        path = task_files.pop(tid, None)
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        tasks.pop(tid, None)
+        task_timestamps.pop(tid, None)
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def get_working_days(start: datetime, end: datetime, skip: list) -> list:
+    """Return list of date strings (YYYY-MM-DD) for Mon-Fri between start and end, excluding skip."""
+    skip_set = set()
+    for s in skip:
+        s = s.strip()
+        if s:
+            try:
+                skip_set.add(parse_date(s).date())
+            except Exception:
+                pass
+
+    days = []
+    current = start.date()
+    end_date = end.date()
+    while current <= end_date:
+        if current.weekday() < 5 and current not in skip_set:
+            days.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    return days
+
+
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
+
+def generate_pdf_background(task_id: str, api_key: str):
+    """Background thread: generate all journal entries and fill PDF."""
+    task = tasks.get(task_id)
+    if not task:
+        return
+
+    try:
+        task["status"] = "generating"
+        task["progress"] = 0
+        daily_work = task["daily_work"]
+        pdf_bytes = task["pdf_bytes"]
+        ojt_timing = task["ojt_timing"]
+        department = task["department"]
+        designation = task["designation"]
+        total = len(daily_work)
+
+        pages_data = []
+
+        for i, day_item in enumerate(daily_work):
+            task["current_page"] = i + 1
+            task["message"] = f"Generating journal entry for Day {i + 1} of {total}…"
+
+            try:
+                entry = generate_journal_entry(api_key, day_item["date"], day_item["work"])
+            except Exception as exc:
+                # Fallback entry on Gemini error
+                entry = {
+                    "my_space": "Worked on assigned tasks for the day.",
+                    "tasks_carried_out": day_item["work"],
+                    "key_learnings": "Gained practical experience.",
+                    "tools_used": "Various tools",
+                    "special_achievements": "N/A",
+                }
+
+            pages_data.append({
+                "date": day_item["date"],
+                "ojt_timing": ojt_timing,
+                "department": department,
+                "designation": designation,
+                "my_space": entry.get("my_space", ""),
+                "tasks_carried_out": entry.get("tasks_carried_out", ""),
+                "key_learnings": entry.get("key_learnings", ""),
+                "tools_used": entry.get("tools_used", ""),
+                "special_achievements": entry.get("special_achievements", ""),
+            })
+
+            task["progress"] = int(((i + 1) / total) * 100)
+
+        task["message"] = "Filling PDF template…"
+        filled_pdf = fill_pdf_with_overlay(pdf_bytes, pages_data)
+
+        # Write to a temp file
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.write(filled_pdf)
+        tmp.flush()
+        tmp.close()
+
+        task_files[task_id] = tmp.name
+        task["status"] = "done"
+        task["progress"] = 100
+        task["message"] = "PDF generated successfully!"
+
+    except Exception:
+        task["status"] = "error"
+        task["message"] = traceback.format_exc()
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+class GenerateRequest(BaseModel):
+    task_id: str
+    api_key: str
+    daily_work: list  # [{day, date, work}, ...]
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/upload")
+async def upload(
+    pdf_file: UploadFile = File(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    skip_dates: str = Form(""),
+    ojt_timing: str = Form(...),
+    department: str = Form(...),
+    designation: str = Form(...),
+    work_description: str = Form(...),
+    api_key: str = Form(...),
+):
+    # Opportunistically clean up old tasks on each upload
+    cleanup_old_tasks()
+
+    try:
+        # Parse dates
+        start_dt = parse_date(start_date)
+        end_dt = parse_date(end_date)
+        if end_dt < start_dt:
+            return JSONResponse(status_code=400, content={"error": "end_date must be after start_date"})
+
+        skip_list = [s.strip() for s in skip_dates.split(",") if s.strip()] if skip_dates else []
+        working_days = get_working_days(start_dt, end_dt, skip_list)
+
+        if not working_days:
+            return JSONResponse(status_code=400, content={"error": "No working days found in the given range."})
+
+        num_days = len(working_days)
+
+        # Read PDF
+        pdf_bytes = await pdf_file.read()
+
+        # Get page count
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_count = len(doc)
+        doc.close()
+
+        # Validate N <= PDF page count
+        if num_days > page_count:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        f"The selected date range produces {num_days} working days, "
+                        f"but the uploaded PDF has only {page_count} page(s). "
+                        "Please upload a PDF with more pages or shorten the date range."
+                    )
+                },
+            )
+
+        # Split work into days via Gemini
+        daily_work = split_work_into_days(api_key, work_description, working_days, num_days)
+
+        task_id = str(uuid.uuid4())
+        tasks[task_id] = {
+            "status": "pending",
+            "pdf_bytes": pdf_bytes,
+            "working_days": working_days,
+            "daily_work": daily_work,
+            "ojt_timing": ojt_timing,
+            "department": department,
+            "designation": designation,
+            "progress": 0,
+            "total_pages": num_days,
+            "current_page": 0,
+            "message": "Ready to generate.",
+        }
+        task_timestamps[task_id] = time.time()
+
+        return {
+            "task_id": task_id,
+            "working_days": working_days,
+            "total_days": num_days,
+            "pdf_pages": page_count,
+            "daily_work": daily_work,
+        }
+
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": traceback.format_exc()})
+
+
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    task = tasks.get(req.task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "Task not found"})
+
+    # Update daily_work with user edits
+    task["daily_work"] = req.daily_work
+    task["status"] = "pending"
+    task["progress"] = 0
+    task["current_page"] = 0
+    task["message"] = "Starting generation…"
+
+    thread = threading.Thread(
+        target=generate_pdf_background,
+        args=(req.task_id, req.api_key),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"task_id": req.task_id, "status": "generating"}
+
+
+@app.get("/status/{task_id}")
+async def get_status(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "Task not found"})
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "progress": task["progress"],
+        "current_page": task["current_page"],
+        "total_pages": task["total_pages"],
+        "message": task.get("message", ""),
+    }
+
+
+@app.get("/download/{task_id}")
+async def download(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "Task not found"})
+    if task["status"] != "done":
+        return JSONResponse(status_code=400, content={"error": "PDF not ready yet"})
+
+    file_path = task_files.get(task_id)
+    if not file_path or not os.path.exists(file_path):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=f"ojt_journal_{task_id[:8]}.pdf",
+    )
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
