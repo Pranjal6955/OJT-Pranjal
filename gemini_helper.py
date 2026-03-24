@@ -115,25 +115,26 @@ RULES:
 - Each day must be unique
 - No repetition
 - No HR/company content
-- Keep concise and realistic
+- BE EXTREMELY CONCISE. Use short phrases.
+- Use bullet points (prefix with "• ") for multi-line fields.
 - Avoid professional/enterprise tools (no Jira, Azure, Salesforce, etc.)
 - Use college-friendly tools: Python, JavaScript, Git, SQL, VS Code, Linux, React, etc.
 
 For EACH day return:
-- my_space: 1-2 lines of personal reflection
-- tasks_carried_out: List items separated by NEWLINE (NOT array)
-- key_learnings: List items separated by NEWLINE (NOT array)
-- tools_used: comma-separated list
-- special_achievements: 1-2 lines (NEVER "N/A")
+- my_space: ONE short sentence of reflection (max 15 words)
+- tasks_carried_out: 2-3 short bullet points (each max 8 words)
+- key_learnings: 2-3 short bullet points (each max 8 words)
+- tools_used: comma-separated list (max 4 tools)
+- special_achievements: ONE short sentence (max 12 words) (NEVER "N/A")
 
 OUTPUT JSON (use plain text with newlines for multi-line fields):
 [
   {{
     "day": 1,
     "my_space": "reflection text",
-    "tasks_carried_out": "Task 1\\nTask 2\\nTask 3",
-    "key_learnings": "Learning 1\\nLearning 2",
-    "tools_used": "tool1, tool2, tool3",
+    "tasks_carried_out": "• Task 1\\n• Task 2",
+    "key_learnings": "• Learning 1\\n• Learning 2",
+    "tools_used": "Tool, Tool",
     "special_achievements": "achievement text"
   }}
 ]
@@ -193,21 +194,20 @@ def generate_journal_entry(api_key: str, date: str, work: str) -> dict:
 Date: {formatted_date}
 Work Done: {work}
 
-Return ONLY a valid JSON object (no markdown, no explanation):
+Return ONLY a valid JSON object:
 {{
-  "my_space": "Brief personal reflection (1-2 sentences)",
-  "tasks_carried_out": "Task 1\\nTask 2\\nTask 3\\nTask 4",
-  "key_learnings": "Learning 1\\nLearning 2\\nLearning 3",
-  "tools_used": "tool1, tool2, tool3",
-  "special_achievements": "Achievement description (1-2 sentences)"
+  "my_space": "ONE short sentence of reflection (max 15 words)",
+  "tasks_carried_out": "• Task 1\\n• Task 2\\n• Task 3",
+  "key_learnings": "• Learning 1\\n• Learning 2",
+  "tools_used": "tool1, tool2, tool3 (max 4 tools)",
+  "special_achievements": "ONE short sentence (max 12 words)"
 }}
 
 IMPORTANT:
 - Use college/student-level tools only (Python, JavaScript, Git, VS Code, Linux, React, etc.)
-- AVOID professional tools like Jira, Azure, Salesforce, enterprise software
-- Use plain newlines (\\n) between items for multi-line fields, NOT JSON arrays
-- Each task/learning should be a complete sentence
-- Keep it concise, professional, realistic, and non-repetitive"""
+- BE EXTREMELY CONCISE. Use bullet points (• ) for lists.
+- Each task/learning should be a short phrase.
+- Total lines per field should not exceed 3-4."""
 
     text = call_gemini(model, prompt)
     return json.loads(text)
